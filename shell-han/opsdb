@@ -1,0 +1,464 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import re
+import json
+import argparse
+import httplib
+import urllib
+
+def http_get(host, port, uri):
+    headers = {'accept': 'application/json'}
+    conn = httplib.HTTPConnection(host, port)
+    conn.request("GET", uri, '', headers)
+    response = conn.getresponse()
+    return response.read()
+
+def http_post(host, port, uri, params):
+    headers = {'accept': 'application/json'}
+    conn = httplib.HTTPConnection(host, port)
+    conn.request("POST", uri, params, headers)
+    response = conn.getresponse()
+    return response.read()
+
+# proceed CMDB API return by user output options:
+def output(cmdbData, userArgs, fullUrl):
+    # print cmdbData
+    # print userArgs
+    # print fullUrl
+    #dataDic = eval(cmdbData.replace('":true','":True'))
+    #print type(dataDic)
+    if cmdbData.endswith('false}'):
+        print 'CMDB return with error...'
+        exit(2)
+
+def dealArgv():
+    # setup cli options:
+    parser = argparse.ArgumentParser(description='Access CMDB by API', prog='opsdb cli')
+
+    # setup query option group:
+    queryOption = parser.add_argument_group('queryOption', 'query options')
+
+    #queryOption = parser.add_mutually_exclusive_group()
+    queryOption.add_argument('-i', '--ip', dest='ips', type=str, help='search object by ip')
+    queryOption.add_argument('-a', '--asset', dest='asset_number', type=str, help='search object by asset_number')
+    queryOption.add_argument('-n', '--nodename', dest='node_name', type=str, help='search object by node_name')
+    queryOption.add_argument('-g', '--node_group', dest='node_group', type=str, help='search object by node_group')
+    queryOption.add_argument('--admin', dest='administrator', type=str, help='search object by administrator')
+    queryOption.add_argument('--state', dest='state', type=str, help='search object by state')
+    queryOption.add_argument('--product', dest='product', type=str, help='search object by product')
+    queryOption.add_argument('-m', '--manifest', type=str, help='search object by manifest in CMDB')
+    queryOption.add_argument('--staff', dest='login_name', type=str, help='search R&D staff infromation')
+    queryOption.add_argument('-q', '--query', type=str, help='use expression with this option')
+    queryOption.add_argument('--downlink', dest='asset_from', type=str, help='search downlink devices')
+    queryOption.add_argument('--uplink', dest='asset_to', type=str, help='search uplink devices')
+    queryOption.add_argument('--site', dest='site_name', type=str, help='search site infor by site_name')
+    queryOption.add_argument('-l', '--log', dest='log', type=str, help='search changelog infor by cn')
+
+    # setup query control option group:
+    queryControlOption = parser.add_argument_group('queryControlOption','query control options')
+    queryControlOption.add_argument('-e', '--exact', action='store_true', help='post exact match query to API')
+    queryControlOption.add_argument('-c', '--count', action='store_true', help='only show the count of the result of query')
+    queryControlOption.add_argument('-N', '--number', type=int, help='set how many objects return')
+
+    # setup output option group:
+    outputOption = parser.add_argument_group('outputOption', 'output options to control results format')
+    # outputOption = parser.add_mutually_exclusive_group()
+    outputOption.add_argument('-s', '--short', action='store_true', help='show only brief information of results')
+    outputOption.add_argument('-d', '--detail', action='store_true', help='print full information of query results')
+    outputOption.add_argument('-f', '--field', help='set the fields of query results')
+    outputOption.add_argument('-b', '--brief', help='set the brief fields of query results')
+    outputOption.add_argument('-D', '--debug', action='store_true', help='show debug information of this cli')
+    # setup help option group:
+    # helpOption = parser.add_argument_group('helpOption','show some useful information')
+    # helpOption.add_argument('-V', '--version', action='store_true',help='show version of this cli')
+
+    Args = parser.parse_args()
+
+    # do some basic check of sys.argv:
+    if len(sys.argv[1:]) == 0:
+        parser.print_help()
+        sys.exit(2)
+
+    # clean argparser.__dict__ items with None value:
+    # print Args.__dict__
+    cliArgs = Args.__dict__
+    for k,v in cliArgs.items():
+        if v is None:
+            del cliArgs[k]
+    # print cliArgs
+    return cliArgs
+
+
+# generate query expression by user options:
+def generate_query(userArgs):
+    try:
+        expression = userArgs['query']
+        # print expression
+        expression.strip()
+        if expression.endswith(' and') or expression.endswith(' or'):
+            print 'Do not play me with unfinished expression!'
+            sys.exit(2)
+        return expression
+    except KeyError:
+        pass
+
+    # if --log is given, "search changelog infor by asset_number"
+    # the userArgs['log] is the assert number
+    if 'log' in userArgs:
+        return "cn==%s" % userArgs['log']
+
+    operator = '==' if userArgs['exact'] else '~'
+
+    expression = []
+    for k, v in userArgs.items():
+        #if you need to pass Args of output, need to add new key into the following lines
+        if type(userArgs[k]) == type(True) or\
+                        k == 'number' or \
+                        k == 'field' or \
+                        k == 'brief':
+            # print k,v
+            # print 'it is bool or setting return number'
+            pass
+        else:
+            #print k,v,'it is not int or bool'
+            if ',' in userArgs[k]:
+                if k != 'ips':
+                    expression.append(k + ' in ' + userArgs[k])
+                else:
+                    tmpExp = str('')
+                    for i in userArgs[k].split(','):
+                        # 'ips~'+i+'or'+'ips~'+i
+                        # print i
+                        tmpExp += 'ips~' + i + ' or '
+                    tmpExp = tmpExp[:-3]
+                    expression.append(tmpExp)
+            else:
+                expression.append(k + operator + v)
+
+    # print 'expression is:',expression
+    fullExpression = ' and '.join(expression)
+    # print fullExpression
+    if fullExpression == '':
+        print 'The options you given mean nothing for query expression...'
+        sys.exit(2)
+    return fullExpression
+
+
+# submit query expression to CMDB API:
+def queryCmdb(expression, userArgs):
+    #print expression,userArgs
+    #apiUrl = 'http://newcmdb.intra.sina.com.cn/api'
+    apiUrl = 'http://newcmdb.intra.sina.com.cn/api'
+    username = 'api4cli'
+    password = 'jBv5N1hVw1Z3dpASG507W18B'
+
+    try:
+        number = userArgs['number']
+    except KeyError:
+        number = 0
+
+    if userArgs['count']:
+        count = 1
+        number = 1  # when running in counting mode,only request 1 obj.
+    else:
+        count = 0
+
+    # #http://newcmdb.intra.sina.com.cn/api?username=api4cli&auth=jBv5N1hVw1Z3dpASG507W18B&num=2000&return_total=0&q=ips~3.3.3.3
+    _host = 'newcmdb.intra.sina.com.cn'
+    _params={
+        'username': username,
+        'auth': password,
+        'num': number,
+        'return_total': count,
+        'q': expression
+    }
+    _uri = '/api?'
+    _uri+= urllib.urlencode(_params)
+    _fullurl = "http://%s%s" % (_host, _uri)
+    #print ">>>", _uri
+    #print ">>>>>>", _fullurl
+    r = http_get(_host, 80, _uri)
+    return r, _fullurl
+
+# proceed CMDB API return by user output options:
+def output(cmdbData, userArgs, fullUrl):
+    # print cmdbData
+    # print userArgs
+    # print fullUrl
+    #dataDic = eval(cmdbData.replace('":true','":True'))
+    #print type(dataDic)
+    if cmdbData.endswith('false}'):
+        print 'CMDB return with error...'
+        exit(2)
+    #
+    # dataDic = eval(re.sub(':\'',':u\'',
+		# 			re.sub('"','\'',
+		# 			re.sub(':\'',':u\'',
+		# 			re.sub('"','\'',
+		# 			re.sub('true',  'True',cmdbData.decode('utf-8')))))))
+    #print 'dataDic is----------->',type(dataDic),dataDic
+    dataDic = json.loads(cmdbData)
+    # for k,v in userArgs.items():
+    # 	print k,v
+    total = dataDic['total']
+    num = dataDic['num']
+    result = dataDic['result']
+
+    shortKey = ['.manifest',
+				'node_name',
+				'asset_number',
+				'sn',
+				'ips',
+				'node_group',
+				'state',
+				'administrator',
+				'product',
+				'rack',
+				'model',
+				'hardware_info',
+				'node_group_name',
+				'user_name',
+				'login_name',
+				'tel',
+				'phone'
+				]
+    #print shortKey
+    def printDetail(result):
+        for i in result:
+            #print type(i)
+            for k,v in i.items():
+                # print 'k is',k,type(k)
+                # print 'v is',v,type(v)
+                if k != '.id':
+                    print str(k)+': '+v.encode('utf8')
+                else:
+                    pass
+            print '-------------------------------------'
+
+    def printShort(result):
+        for i in result:
+            for k in shortKey:
+                try:
+                    print str(k)+': '+i[k].encode('utf8')
+                except KeyError:
+                    pass
+            print '-------------------------------------'
+
+    def printDefault(result):
+        if len(result) == 0:
+            print ':( Nothing return from CMDB...'
+        elif len(result) == 1:
+            try:
+                print '-------------------------------------'
+                printShort(result)
+                return
+            except KeyError:
+                print '---------KeyError------------------'
+                return
+
+        for i in result:
+            try:
+                if i['node_name'] != '':
+                    print i['node_name']
+                else:
+                    print 'node_name is NULL-->',i['.cn']
+            except KeyError:
+                print unicode(i['.cn']).encode('utf-8')
+
+    def printField(result,field):
+        #print result
+        fieldList = field.split(',')
+        #print fieldList,type(fieldList)
+        for i in result:
+            for ii in fieldList:
+                #print ii
+                try:
+                    print str(ii)+': '+i[ii].encode('utf8')
+                except KeyError:
+                    #print 'KeyError'
+                    pass
+            print '-------------------------------------'
+
+    def briefField(result,field):
+        fieldList = field.split(',')
+        # print fieldList
+        # print type(result),result
+        for i in result:
+            tmpBrief = ''
+            for ii in fieldList:
+                try:
+                    #print i.encode('utf8')
+                    #tmpBrief = tmpBrief + str(ii)+': '+i[ii].encode('utf8')+'---'
+                    tmpBrief = tmpBrief + i[ii].encode('utf8')+'|||'
+                except KeyError:
+                    pass
+            print tmpBrief[:-3]
+
+    if userArgs['detail']:
+        #print 'detail is True'
+        print '-------------------------------------'
+        printDetail(result)
+        return
+
+    if userArgs['short']:
+        #print 'short is True'
+        print '-------------------------------------'
+        printShort(result)
+        return
+
+    try:
+        if userArgs['field']:
+            print '-------------------------------------'
+            #print 'user constumized field-----'
+            printField(result,userArgs['field'])
+            return
+    except KeyError:
+        pass
+
+    try:
+        if userArgs['brief']:
+            briefField(result,userArgs['brief'])
+            # print userArgs['brief']
+            return
+    except KeyError:
+        pass
+
+    if userArgs['count']:
+        #print 'count is True'
+        print total#,'objects match your query option'
+        return
+
+    if userArgs['debug']:
+        print '-------------------------------------'
+        print 'Running in Debug mode'
+        print '-------------------------------------'
+        print 'Querying======>',fullUrl
+        print '-------------------------------------'
+        printShort(result)
+        print result
+        print '-------------------------------------'
+        print 'User options are:',userArgs
+        print '-------------------------------------'
+        print 'The count of objects returned is:',num
+        print '-------------------------------------'
+        print 'The url has been Queryed======>',fullUrl
+        return
+
+    #print result
+    printDefault(result)
+    return
+
+
+def extractObjectId(cmdbData):
+    """
+    从cmdbData中提取objectId, 供查找changelog使用。
+
+    :param  cmdbData, queryCmdb返回的数据
+    :return: object_id, 类型 str, 为postgresql id
+    """
+
+    data = json.loads(cmdbData)
+    result = data.get('result')
+
+    if len(result) > 1:
+        raise Exception('get multi result with one assert number')
+
+    result = result[0]
+
+    if '.id' not in result:
+        raise Exception("can't get .id from the cmdb data")
+
+    return result.get('.id')
+
+
+def getChangeLogByObjectId(objectId):
+    """
+    在changelog数据库中查找objectId对应"设备的"changelog, 现在测试机开的9999端口供查找changelog服务，
+
+    :param objectId:
+    :return: log_num, log_content
+    """
+    #changeLogUrl = 'http://newcmdb.intra.sina.com.cn/api'
+
+    _host = 'newcmdb.intra.sina.com.cn'
+    _params={
+        'username': 'api4cli',
+        'auth': 'jBv5N1hVw1Z3dpASG507W18B',
+        'q': 'manifest == changelog and id == %s' % objectId,
+        'return_total': 1,
+        'order_by': 'date',
+        'order': 'desc',
+        'num': 1000
+    }
+    _uri = '/api?'
+    _uri+= urllib.urlencode(_params)
+    r = http_get(_host, 80, _uri)
+
+    data = json.loads(r)
+    #data = json.loads(r.content)
+
+    logList = data['result']
+
+    log_update_tpl = u"""
+    {username} 在{date} 更新了数据
+      {fieldname} 由 {origin_value} 更改为 {changed_value}
+    """.encode('utf-8')
+
+    log_insert_tpl = u"""
+    {username} 在{date} 插入了数据
+      {fieldname}: {changed_value}
+    """.encode('utf-8')
+
+    log_tpl_dict = {
+        'update': log_update_tpl,
+        'insert': log_insert_tpl
+    }
+
+    log_output = []
+
+    fieldsNeeded = ['username', 'fieldname', 'origin_value', 'changed_value']
+
+    for log in logList:
+        for filed in fieldsNeeded:
+            if filed in log:
+                log[filed] = unicode(log[filed]).encode('utf-8')
+
+        if 'origin_value' in log and not log['origin_value']:
+            log['origin_value'] = None
+
+        action = log.get('action', 'update').lower()
+        log_tpl = log_tpl_dict.get(action)
+        log_output.append(log_tpl.format(**log))
+
+    log_num = data['num']
+    log_content = os.linesep.join(log_output)
+
+    return log_num, log_content
+
+
+def main():
+    userArgs = dealArgv()
+    expression = generate_query(userArgs)
+    cmdbData, fullUrl = queryCmdb(expression, userArgs)
+
+    if 'log' not in userArgs:
+        output(cmdbData, userArgs, fullUrl)
+    else:
+        objectId = extractObjectId(cmdbData)
+        log_num, log_cotent = getChangeLogByObjectId(objectId)
+        if log_num == 0:
+            print '-------------------------------------'
+            print "no logs for object with cn %s" % userArgs.get('log')
+            print '-------------------------------------'
+        else:
+            print '-------------------------------------'
+            print "共%s条日志" % log_num
+            print log_cotent
+            print '-------------------------------------'
+
+
+if __name__ == '__main__':
+    main()
